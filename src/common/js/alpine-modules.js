@@ -963,6 +963,7 @@ function onlineStats() {
   const API_SUMMARY = '/apis/online-user.zyx2012.cn/v1alpha1/stats/summary';
   const API_STATS = '/apis/online-user.zyx2012.cn/v1alpha1/stats';
   const MAX_HOT_PAGES = 5;
+  const MIN_LOAD_INTERVAL = 1500;
 
   // 已知路由 → 友好名称
   const KNOWN_ROUTES = {
@@ -992,15 +993,57 @@ function onlineStats() {
     updatedAt: '',
     hotPages: [],
     showHotPages: true,
+    _loadTimer: null,
+    _loadPromise: null,
+    _lastLoadAt: 0,
+    _registeredHandler: null,
+    _pathChangedHandler: null,
 
     init() {
       this.showHotPages = this.$el.dataset.showHotPages !== 'false';
-      this.loadData();
-      window.addEventListener('online-monitor:registered', () => this.loadData());
-      window.addEventListener('online-monitor:path-changed', () => this.loadData());
+      this._registeredHandler = () => this.scheduleLoadData();
+      this._pathChangedHandler = () => this.scheduleLoadData();
+      window.addEventListener('online-monitor:registered', this._registeredHandler);
+      window.addEventListener('online-monitor:path-changed', this._pathChangedHandler);
+      this.scheduleLoadData({ immediate: true });
+    },
+
+    destroy() {
+      if (this._registeredHandler) {
+        window.removeEventListener('online-monitor:registered', this._registeredHandler);
+      }
+      if (this._pathChangedHandler) {
+        window.removeEventListener('online-monitor:path-changed', this._pathChangedHandler);
+      }
+      clearTimeout(this._loadTimer);
+      this._loadTimer = null;
+    },
+
+    scheduleLoadData(options = {}) {
+      const now = Date.now();
+      const wait = options.immediate ? 0 : Math.max(0, MIN_LOAD_INTERVAL - (now - this._lastLoadAt));
+      clearTimeout(this._loadTimer);
+
+      if (this._loadPromise && wait === 0) return this._loadPromise;
+
+      if (wait > 0) {
+        this._loadTimer = setTimeout(() => this.loadData(), wait);
+        return null;
+      }
+
+      return this.loadData();
     },
 
     async loadData() {
+      if (this._loadPromise) return this._loadPromise;
+      this._lastLoadAt = Date.now();
+      this._loadPromise = this.fetchData().finally(() => {
+        this._loadPromise = null;
+      });
+      return this._loadPromise;
+    },
+
+    async fetchData() {
       try {
         const fetches = [fetch(API_SUMMARY)];
         if (this.showHotPages) fetches.push(fetch(API_STATS));

@@ -99,6 +99,166 @@ if (window.__skyPjaxEnabled !== false) {
     _currentSignaled = true;
   };
 
+  function dispatchPjaxCompatibilityEvents(detail) {
+    ['pjax:success', 'pjax:complete', 'pjax:end', 'swup:contentReplaced', 'swup:page:view'].forEach((name) => {
+      document.dispatchEvent(new CustomEvent(name, {
+        detail,
+        bubbles: true,
+        cancelable: true,
+      }));
+    });
+  }
+
+  function getLightGallerySelectors() {
+    const selectors = new Set(['#article-content', '#photo-grid', '.moment-media']);
+    const selectorMatchers = [
+      /querySelectorAll\(\s*`([^`]+)`\s*\)/g,
+      /querySelectorAll\(\s*'([^']+)'\s*\)/g,
+      /querySelectorAll\(\s*"([^"]+)"\s*\)/g,
+    ];
+
+    const addSelector = (selector) => {
+      const normalized = selector
+        .trim()
+        .replace(/\s+img\s*$/i, '')
+        .trim();
+      if (normalized) selectors.add(normalized);
+    };
+
+    document.querySelectorAll('script').forEach((script) => {
+      const code = script.textContent || '';
+      if (!code.includes('lightGallery(')) return;
+
+      selectorMatchers.forEach((matcher) => {
+        let match;
+        while ((match = matcher.exec(code))) {
+          if (match[1]) addSelector(match[1]);
+        }
+      });
+    });
+
+    return selectors;
+  }
+
+  function initLightGalleryForPjaxPage() {
+    if (typeof window.lightGallery !== 'function') return false;
+
+    const selectors = getLightGallerySelectors();
+    let handled = false;
+
+    selectors.forEach((selector) => {
+      let galleries;
+      try {
+        galleries = document.querySelectorAll(selector);
+      } catch {
+        return;
+      }
+
+      galleries.forEach((gallery) => {
+        if (!(gallery instanceof Element)) return;
+        if (gallery.dataset.skyLightgalleryBound === 'true' || gallery.hasAttribute('lg-uid')) {
+          gallery.dataset.skyLightgalleryBound = 'true';
+          handled = true;
+          return;
+        }
+        if (!gallery.querySelector('img')) return;
+
+        gallery.querySelectorAll('img').forEach((img) => {
+          if (!img.dataset.src) img.dataset.src = img.currentSrc || img.src;
+        });
+
+        try {
+          window.lightGallery(gallery, { selector: 'img' });
+          gallery.dataset.skyLightgalleryBound = 'true';
+          handled = true;
+        } catch (error) {
+          console.warn('[SkyPjax] lightGallery init failed:', error);
+        }
+      });
+    });
+
+    return handled;
+  }
+
+  function loadLightGalleryScript(src) {
+    if (!src) return Promise.resolve();
+    window.__skyLightGalleryLoadedScripts = window.__skyLightGalleryLoadedScripts || new Set();
+    if (window.__skyLightGalleryLoadedScripts.has(src)) return Promise.resolve();
+
+    return new Promise((resolve) => {
+      const staleScript = Array.from(document.querySelectorAll('script[src]'))
+        .find((script) => script.src === src && script.getAttribute('data-sky-lightgallery-executed') !== 'true');
+      const script = document.createElement('script');
+      script.src = src;
+      script.async = false;
+      script.setAttribute('data-sky-lightgallery-executed', 'true');
+      script.onload = () => {
+        window.__skyLightGalleryLoadedScripts.add(src);
+        resolve();
+      };
+      script.onerror = () => resolve();
+      if (staleScript?.parentNode) {
+        staleScript.parentNode.replaceChild(script, staleScript);
+      } else {
+        document.head.appendChild(script);
+      }
+    });
+  }
+
+  function ensureLightGalleryReady() {
+    if (typeof window.lightGallery === 'function') return Promise.resolve(true);
+    if (window.__skyLightGalleryReadyPromise) return window.__skyLightGalleryReadyPromise;
+
+    const scripts = Array.from(document.querySelectorAll('script[src*="/plugins/PluginLightGallery/assets/static/js/"]'))
+      .map((script) => script.src)
+      .filter(Boolean)
+      .sort((a, b) => {
+        const aCore = a.includes('/lightgallery.min.js') || a.includes('/lightgallery.js');
+        const bCore = b.includes('/lightgallery.min.js') || b.includes('/lightgallery.js');
+        if (aCore === bCore) return 0;
+        return aCore ? -1 : 1;
+      });
+
+    if (scripts.length === 0) return Promise.resolve(false);
+
+    window.__skyLightGalleryReadyPromise = scripts
+      .reduce((chain, src) => chain.then(() => loadLightGalleryScript(src)), Promise.resolve())
+      .then(() => typeof window.lightGallery === 'function')
+      .finally(() => {
+        window.__skyLightGalleryReadyPromise = null;
+      });
+
+    return window.__skyLightGalleryReadyPromise;
+  }
+
+  let lightGalleryInitToken = 0;
+
+  function scheduleLightGalleryPjaxInit() {
+    const token = ++lightGalleryInitToken;
+    let attempts = 0;
+
+    const run = () => {
+      if (token !== lightGalleryInitToken) return;
+      attempts += 1;
+      ensureLightGalleryReady().then((ready) => {
+        if (token !== lightGalleryInitToken) return;
+        if (ready && initLightGalleryForPjaxPage()) return;
+        if (attempts < 50) window.setTimeout(run, 100);
+      });
+    };
+
+    requestAnimationFrame(run);
+  }
+
+  window.SkyLightGallery = {
+    init: scheduleLightGalleryPjaxInit,
+    initNow: () => ensureLightGalleryReady().then((ready) => ready && initLightGalleryForPjaxPage()),
+  };
+
+  document.addEventListener('sky:page-load', (event) => {
+    if (event.detail?.pjax) scheduleLightGalleryPjaxInit();
+  });
+
   /** Alpine 恢复动作，rAF 后执行确保 DOM paint 完成 */
   function _resumeAlpine() {
     requestAnimationFrame(() => {
@@ -109,7 +269,9 @@ if (window.__skyPjaxEnabled !== false) {
         if (container && window.Alpine) Alpine.initTree(container);
       }
       window.SkyEvents?.onPageLoad();
-      window.SkyPjax?._runPage?.({ initial: false, pjax: true, url: window.location.href });
+      const pageDetail = { initial: false, pjax: true, url: window.location.href };
+      window.SkyPjax?._runPage?.(pageDetail);
+      dispatchPjaxCompatibilityEvents(pageDetail);
     });
   }
 
